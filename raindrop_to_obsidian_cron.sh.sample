@@ -1,0 +1,12 @@
+#!/bin/bash
+# raindrop_to_obsidian.rb を cron から実行するためのラッパー
+
+export RAINDROP_TOKEN="your-raindrop-token"
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export OBSIDIAN_VAULT="/home/yuichi/Documents/My Vault"
+
+# rbenv を初期化
+export PATH="$HOME/.rbenv/bin:$PATH"
+eval "$(rbenv init - bash)"
+
+exec ruby "$HOME/Documents/Projects/raindrop_to_obsidian/raindrop_to_obsidian.rb" "$@"
