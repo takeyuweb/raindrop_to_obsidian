@@ -74,17 +74,33 @@ end
 
 # ── Anthropic API ─────────────────────────────────────────
 
-def summarize_bookmark(item, highlights)
+def anthropic_request(model:, max_tokens:, prompt:)
+  uri = URI('https://api.anthropic.com/v1/messages')
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type']      = 'application/json'
+  req['x-api-key']         = ANTHROPIC_API_KEY
+  req['anthropic-version'] = '2023-06-01'
+  req.body = JSON.generate(
+    model:      model,
+    max_tokens: max_tokens,
+    messages:   [{ role: 'user', content: prompt }]
+  )
+
+  res  = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |h| h.request(req) }
+  data = JSON.parse(res.body)
+  data.dig('content', 0, 'text')&.strip
+end
+
+def bookmark_context(item, highlights)
   title      = item['title'].to_s
   url        = item['link'].to_s
   excerpt    = item['excerpt'].to_s
   tags       = (item['tags'] || []).join(', ')
   collection = item.dig('collection', 'title').to_s
   hl_texts   = highlights.map { |h| h['text'] }.compact.join("\n")
-
   note       = item['note'].to_s
 
-  context = <<~TEXT
+  <<~TEXT
     タイトル: #{title}
     URL: #{url}
     コレクション: #{collection}
@@ -94,29 +110,47 @@ def summarize_bookmark(item, highlights)
     ハイライト:
     #{hl_texts.empty? ? '（なし）' : hl_texts}
   TEXT
+end
 
+def summarize_bookmark(item, highlights)
   prompt = <<~PROMPT
     以下のウェブページの情報をもとに、日本語で2〜3文の簡潔な要約を作成してください。
     要約は「何についてのページか」「なぜ重要か・何が学べるか」を含めてください。
     余計な前置きや説明は不要です。要約文のみ出力してください。
 
-    #{context}
+    #{bookmark_context(item, highlights)}
   PROMPT
 
-  uri = URI('https://api.anthropic.com/v1/messages')
-  req = Net::HTTP::Post.new(uri)
-  req['Content-Type']      = 'application/json'
-  req['x-api-key']         = ANTHROPIC_API_KEY
-  req['anthropic-version'] = '2023-06-01'
-  req.body = JSON.generate(
-    model:      'claude-haiku-4-5-20251001',
-    max_tokens: 300,
-    messages:   [{ role: 'user', content: prompt }]
-  )
+  anthropic_request(model: 'claude-haiku-4-5-20251001', max_tokens: 300, prompt: prompt) ||
+    '（要約取得失敗）'
+end
 
-  res  = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |h| h.request(req) }
-  data = JSON.parse(res.body)
-  data.dig('content', 0, 'text')&.strip || '（要約取得失敗）'
+def review_note(item, highlights)
+  note = item['note'].to_s
+  return nil if note.empty?
+
+  prompt = <<~PROMPT
+    以下はあるウェブページに対してユーザーが書いたコメント（ノート）です。
+    ウェブページの情報も合わせて提供します。
+
+    コメントの内容を分析し、以下に該当する場合のみ日本語で補足してください：
+    - 事実誤認や誤った理解がある場合 → 正しい情報を簡潔に説明
+    - 疑問文が含まれている場合 → ページの情報やハイライトをもとに回答
+
+    該当しない場合（コメントが正確で疑問もない場合）は、「なし」とだけ出力してください。
+    余計な前置きは不要です。補足内容のみ出力してください。
+
+    --- ユーザーのコメント ---
+    #{note}
+
+    --- ページ情報 ---
+    #{bookmark_context(item, highlights)}
+  PROMPT
+
+  result = anthropic_request(model: 'claude-sonnet-4-6', max_tokens: 500, prompt: prompt)
+  return nil if result.nil? || result == 'なし'
+
+  result
 end
 
 # ── Markdown 生成 ─────────────────────────────────────────
@@ -140,17 +174,30 @@ def build_section(bookmarks)
     summary = summarize_bookmark(item, highlights)
     puts '✓'
 
+    # ノートの補足（誤認訂正・疑問回答）
+    note = item['note'].to_s
+    review = nil
+    unless note.empty?
+      print "  補足確認中: #{title[0..50]}... "
+      review = review_note(item, highlights)
+      puts review ? '✓ 補足あり' : '– 補足なし'
+    end
+
     lines << "### [#{title}](#{url})"
     lines << "_#{collection}_ #{tags}".strip
     lines << ''
     lines << summary
     lines << ''
 
-    note = item['note'].to_s
     unless note.empty?
       lines << '**ノート:**'
       lines << note
       lines << ''
+      if review
+        lines << '**補足:**'
+        lines << review
+        lines << ''
+      end
     end
 
     if highlights.any?
