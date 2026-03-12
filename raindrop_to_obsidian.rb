@@ -20,6 +20,8 @@ require 'net/http'
 require 'json'
 require 'date'
 require 'fileutils'
+require 'uri'
+require 'timeout'
 
 # ── 設定 ────────────────────────────────────────────────
 RAINDROP_TOKEN    = ENV.fetch('RAINDROP_TOKEN')
@@ -72,6 +74,74 @@ def fetch_highlights(raindrop_id)
   data.dig('item', 'highlights') || []
 end
 
+# ── ページコンテンツ取得 ────────────────────────────────────
+
+MAX_CONTENT_LENGTH = 12_000  # LLMに渡すテキストの最大文字数
+
+def strip_html(html)
+  text = html
+    .gsub(/<script[^>]*>.*?<\/script>/mi, '')
+    .gsub(/<style[^>]*>.*?<\/style>/mi, '')
+    .gsub(/<nav[^>]*>.*?<\/nav>/mi, '')
+    .gsub(/<footer[^>]*>.*?<\/footer>/mi, '')
+    .gsub(/<header[^>]*>.*?<\/header>/mi, '')
+    .gsub(/<!--.*?-->/m, '')
+    .gsub(/<[^>]+>/, ' ')
+    .gsub(/&nbsp;/, ' ')
+    .gsub(/&amp;/, '&')
+    .gsub(/&lt;/, '<')
+    .gsub(/&gt;/, '>')
+    .gsub(/&quot;/, '"')
+    .gsub(/&#\d+;/, '')
+    .gsub(/\s+/, ' ')
+    .strip
+  text
+end
+
+def fetch_page_content(url)
+  uri = URI(url)
+  return nil unless uri.scheme&.match?(/^https?$/)
+
+  Timeout.timeout(15) do
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https',
+                               open_timeout: 10, read_timeout: 10) do |http|
+      req = Net::HTTP::Get.new(uri)
+      req['User-Agent'] = 'Mozilla/5.0 (compatible; RaindropToObsidian/1.0)'
+      req['Accept'] = 'text/html'
+      http.request(req)
+    end
+
+    # リダイレクト対応（1回まで）
+    if response.is_a?(Net::HTTPRedirection) && response['location']
+      redirect_uri = URI(response['location'])
+      response = Net::HTTP.start(redirect_uri.hostname, redirect_uri.port,
+                                 use_ssl: redirect_uri.scheme == 'https',
+                                 open_timeout: 10, read_timeout: 10) do |http|
+        req = Net::HTTP::Get.new(redirect_uri)
+        req['User-Agent'] = 'Mozilla/5.0 (compatible; RaindropToObsidian/1.0)'
+        req['Accept'] = 'text/html'
+        http.request(req)
+      end
+    end
+
+    return nil unless response.is_a?(Net::HTTPSuccess)
+
+    content_type = response['content-type'].to_s
+    return nil unless content_type.include?('text/html') || content_type.include?('text/plain')
+
+    body = response.body
+    # エンコーディング対応
+    body.force_encoding('UTF-8') unless body.encoding == Encoding::UTF_8
+    body.encode!('UTF-8', invalid: :replace, undef: :replace, replace: '')
+
+    text = strip_html(body)
+    text.length > MAX_CONTENT_LENGTH ? text[0...MAX_CONTENT_LENGTH] : text
+  end
+rescue StandardError => e
+  warn "    ⚠️  ページ取得失敗 (#{url}): #{e.message}"
+  nil
+end
+
 # ── Anthropic API ─────────────────────────────────────────
 
 def anthropic_request(model:, max_tokens:, prompt:)
@@ -91,7 +161,7 @@ def anthropic_request(model:, max_tokens:, prompt:)
   data.dig('content', 0, 'text')&.strip
 end
 
-def bookmark_context(item, highlights)
+def bookmark_context(item, highlights, page_content = nil)
   title      = item['title'].to_s
   url        = item['link'].to_s
   excerpt    = item['excerpt'].to_s
@@ -100,7 +170,7 @@ def bookmark_context(item, highlights)
   hl_texts   = highlights.map { |h| h['text'] }.compact.join("\n")
   note       = item['note'].to_s
 
-  <<~TEXT
+  context = <<~TEXT
     タイトル: #{title}
     URL: #{url}
     コレクション: #{collection}
@@ -110,22 +180,43 @@ def bookmark_context(item, highlights)
     ハイライト:
     #{hl_texts.empty? ? '（なし）' : hl_texts}
   TEXT
+
+  if page_content && !page_content.empty?
+    context += <<~TEXT
+
+      --- ページ本文 ---
+      #{page_content}
+    TEXT
+  end
+
+  context
 end
 
-def summarize_bookmark(item, highlights)
+def summarize_bookmark(item, highlights, page_content = nil)
   prompt = <<~PROMPT
     以下のウェブページの情報をもとに、日本語で2〜3文の簡潔な要約を作成してください。
+    要約には憶測や推論を交えず、記載された事実のみを含めてください。
     要約は「何についてのページか」「なぜ重要か・何が学べるか」を含めてください。
-    余計な前置きや説明は不要です。要約文のみ出力してください。
 
-    #{bookmark_context(item, highlights)}
+    要約の後に、ポイントとなる内容を1〜3点、箇条書き（「- 」始まり）で添えてください。
+
+    出力形式:
+    要約文
+
+    - ポイント1
+    - ポイント2
+    - ポイント3
+
+    余計な前置きや説明は不要です。
+
+    #{bookmark_context(item, highlights, page_content)}
   PROMPT
 
-  anthropic_request(model: 'claude-haiku-4-5-20251001', max_tokens: 300, prompt: prompt) ||
+  anthropic_request(model: 'claude-haiku-4-5-20251001', max_tokens: 500, prompt: prompt) ||
     '（要約取得失敗）'
 end
 
-def review_note(item, highlights)
+def review_note(item, highlights, page_content = nil)
   note = item['note'].to_s
   return nil if note.empty?
 
@@ -144,7 +235,7 @@ def review_note(item, highlights)
     #{note}
 
     --- ページ情報 ---
-    #{bookmark_context(item, highlights)}
+    #{bookmark_context(item, highlights, page_content)}
   PROMPT
 
   result = anthropic_request(model: 'claude-sonnet-4-6', max_tokens: 500, prompt: prompt)
@@ -169,9 +260,14 @@ def build_section(bookmarks)
     # ハイライト取得
     highlights = fetch_highlights(item['_id'])
 
+    # ページコンテンツ取得
+    print "  ページ取得中: #{title[0..50]}... "
+    page_content = fetch_page_content(url)
+    puts page_content ? "✓ (#{page_content.length}文字)" : '– スキップ'
+
     # LLM要約
     print "  要約中: #{title[0..50]}... "
-    summary = summarize_bookmark(item, highlights)
+    summary = summarize_bookmark(item, highlights, page_content)
     puts '✓'
 
     # ノートの補足（誤認訂正・疑問回答）
@@ -179,7 +275,7 @@ def build_section(bookmarks)
     review = nil
     unless note.empty?
       print "  補足確認中: #{title[0..50]}... "
-      review = review_note(item, highlights)
+      review = review_note(item, highlights, page_content)
       puts review ? '✓ 補足あり' : '– 補足なし'
     end
 
