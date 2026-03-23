@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # raindrop_to_obsidian.rb
 #
-# 前日のRaindropブックマークを取得し、LLMで要約してObsidianのデイリーノートに追記する
+# 前日のRaindropブックマークを取得し、LLMで要約して当日のObsidianデイリーノートに追記する
 #
 # 必要な環境変数:
 #   RAINDROP_TOKEN    - Raindrop.io API トークン
@@ -40,6 +40,9 @@ TARGET_DATE = if ARGV[0]
               else
                 jst_today - 1
               end
+
+# 書き込み先は常に当日のデイリーノート
+NOTE_DATE = jst_today
 
 # ── Raindrop API ─────────────────────────────────────────
 
@@ -339,7 +342,7 @@ def daily_note_path(date)
 end
 
 def write_daily_note(content)
-  note_path = daily_note_path(TARGET_DATE)
+  note_path = daily_note_path(NOTE_DATE)
   FileUtils.mkdir_p(File.dirname(note_path))
 
   if File.exist?(note_path)
@@ -353,7 +356,7 @@ def write_daily_note(content)
     puts "✅ 追記しました: #{note_path}"
   else
     # テンプレートから新規作成
-    note_body = build_note_from_template(TARGET_DATE)
+    note_body = build_note_from_template(NOTE_DATE)
     File.write(note_path, note_body + "\n" + content)
     puts "✅ テンプレートから新規作成しました: #{note_path}"
   end
